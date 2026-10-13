@@ -2,30 +2,32 @@ name: Liz E2E Smoke Tests
 
 # deploys it on K3s + Rancher and runs the
 # rancher/liz-e2e `smoke` tests against it.
-#
-# Required repository secrets:
-#   LIZ_E2E_DEPLOY_KEY - private SSH key of a read-only deploy key added to
-#                        rancher/liz-e2e (Settings > Deploy keys).
-#   GOOGLE_API_KEY  - Gemini key used by the agent and the DeepEval judge.
-# Optional (only needed when the matching matrix entries are enabled):
-#   OPENAI_API_KEY, OPENAI_URL, AWS_BEARER_TOKEN_BEDROCK, AWS_REGION
 
 on:
-  pull_request_target:
+  pull_request:
     branches:
       - main
     types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      k3s_version:
+        description: 'K3s version to install (e.g. v1.34.6+k3s1)'
+        required: true
+        default: 'v1.34.6+k3s1'
+        type: string
+      rancher_version:
+        description: 'Rancher version to install (e.g. v2.13.6)'
+        required: true
+        default: 'v2.13.6'
+        type: string
 
 permissions: {}
 
-concurrency:
-  group: liz-e2e-smoke-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
-
 env:
-  K3S_VERSION: v1.34.6+k3s1
+  # Inputs are only set on workflow_dispatch; pull_request runs use the defaults
+  K3S_VERSION: ${{ inputs.k3s_version || 'v1.34.6+k3s1' }}
   CERT_MANAGER_VERSION: v1.19.5
-  RANCHER_VERSION: v2.13.6
+  RANCHER_VERSION: ${{ inputs.rancher_version || 'v2.13.6' }}
   RANCHER_REPO: https://charts.rancher.com/server-charts/prime
   AGENT_REGISTRY: stgregistry.suse.com
   AGENT_IMAGE_REPOSITORY: rancher/rancher-ai-agent
@@ -36,34 +38,13 @@ env:
   PYTEST_MARKER: smoke
 
 jobs:
-  authorize:
-    name: Authorize PR author
-    if: github.event.pull_request.draft == false && github.event.pull_request.user.type != 'Bot'
-    runs-on: ubuntu-latest
-    permissions: {}
-    outputs:
-      allowed: ${{ steps.check.outputs.allowed }}
-    steps:
-      - name: Check PR author has write access
-        id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-          AUTHOR: ${{ github.event.pull_request.user.login }}
-          REPO: ${{ github.repository }}
-        run: |
-          PERMISSION=$(gh api "repos/${REPO}/collaborators/${AUTHOR}/permission" --jq .permission 2>/dev/null || echo "none")
-          echo "PR author '${AUTHOR}' has '${PERMISSION}' permission on ${REPO}"
-          if [ "$PERMISSION" = "admin" ] || [ "$PERMISSION" = "write" ]; then
-            echo "allowed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "allowed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipping Liz E2E smoke tests: only users with write access to ${REPO} can trigger them."
-          fi
-
   liz-e2e-smoke:
     name: Liz E2E Smoke - ${{ matrix.llm.active_llm }} (${{ matrix.llm.model }})
-    needs: authorize
-    if: needs.authorize.outputs.allowed == 'true'
+    if: >-
+      github.event_name == 'workflow_dispatch' || (
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.user.type != 'Bot')
     # Self-hosted alternative used by liz-e2e (needs the RunsOn app enabled for this repo):
     # runs-on: runs-on,runner=8cpu-linux-x64,mem=16,run-id=${{ github.run_id }},image=ubuntu24-full-x64
     runs-on: ubuntu-latest
@@ -72,8 +53,7 @@ jobs:
       contents: read
     env:
       KUBECONFIG: /etc/rancher/k3s/k3s.yaml
-      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-      AGENT_IMAGE_TAG: pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+      AGENT_IMAGE_TAG: ${{ github.event_name == 'pull_request' && format('pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || format('manual-{0}', github.sha) }}
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -100,10 +80,21 @@ jobs:
             exit 1
           fi
 
+      - name: Validate version inputs
+        run: |
+          if ! [[ "$K3S_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$ ]]; then
+            echo "::error::Invalid K3s version '$K3S_VERSION' (expected e.g. v1.34.6+k3s1)"
+            exit 1
+          fi
+          if ! [[ "$RANCHER_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid Rancher version '$RANCHER_VERSION' (expected e.g. v2.13.6)"
+            exit 1
+          fi
+          echo "K3s: $K3S_VERSION | Rancher: $RANCHER_VERSION"
+
       - name: Checkout PR code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           persist-credentials: false
 
       - name: Free disk space
