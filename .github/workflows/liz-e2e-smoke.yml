@@ -1,0 +1,398 @@
+name: Liz E2E Smoke Tests
+
+# deploys it on K3s + Rancher and runs the
+# rancher/liz-e2e `smoke` tests against it.
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      k3s_version:
+        description: 'K3s version to install (e.g. v1.34.6+k3s1)'
+        required: true
+        default: 'v1.34.6+k3s1'
+        type: string
+      rancher_version:
+        description: 'Rancher version to install (e.g. v2.13.6)'
+        required: true
+        default: 'v2.13.6'
+        type: string
+
+permissions: {}
+
+env:
+  # Inputs are only set on workflow_dispatch; pull_request runs use the defaults
+  K3S_VERSION: ${{ inputs.k3s_version || 'v1.34.6+k3s1' }}
+  CERT_MANAGER_VERSION: v1.19.5
+  RANCHER_VERSION: ${{ inputs.rancher_version || 'v2.13.6' }}
+  RANCHER_REPO: https://charts.rancher.com/server-charts/prime
+  AGENT_REGISTRY: stgregistry.suse.com
+  AGENT_IMAGE_REPOSITORY: rancher/rancher-ai-agent
+  AGENT_UI_GIT_REPO: https://github.com/rancher/rancher-ai-ui
+  AGENT_UI_HELM_REPO: https://rancher.github.io/rancher-ai-ui/
+  LIZ_E2E_REF: main
+  LIZ_E2E_TESTS: tests/e2e/test_rancher_agent_mcp_tools.py
+  PYTEST_MARKER: smoke
+
+jobs:
+  liz-e2e-smoke:
+    name: Liz E2E Smoke - ${{ matrix.llm.active_llm }} (${{ matrix.llm.model }})
+    # if: >-
+    #   github.event_name == 'workflow_dispatch' || (
+    #   github.event.pull_request.head.repo.full_name == github.repository &&
+    #   github.event.pull_request.draft == false &&
+    #   github.event.pull_request.user.type != 'Bot')
+    # Self-hosted alternative used by liz-e2e (needs the RunsOn app enabled for this repo):
+    # runs-on: runs-on,runner=8cpu-linux-x64,mem=16,run-id=${{ github.run_id }},image=ubuntu24-full-x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+      AGENT_IMAGE_TAG: ${{ github.event_name == 'pull_request' && format('pr-{0}-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || format('manual-{0}', github.sha) }}
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        llm:
+          # Gemini
+          - active_llm: "gemini"
+            model: "gemini-3.5-flash-lite"
+          # Add more providers/models below (the matching secrets must exist in this repo)
+          # Bedrock
+          # - active_llm: "bedrock"
+          #   model: "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+          # OpenAI
+          # - active_llm: "openai"
+          #   model: "gpt-4o"
+
+    steps:
+      - name: Verify required secrets
+        env:
+          LIZ_E2E_DEPLOY_KEY: ${{ secrets.LIZ_E2E_DEPLOY_KEY }}
+        run: |
+          if [ -z "$LIZ_E2E_DEPLOY_KEY" ]; then
+            echo "::error::LIZ_E2E_DEPLOY_KEY secret is not configured. It must be a read-only deploy key of rancher/liz-e2e."
+            exit 1
+          fi
+
+      - name: Validate version inputs
+        run: |
+          if ! [[ "$K3S_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\+k3s[0-9]+$ ]]; then
+            echo "::error::Invalid K3s version '$K3S_VERSION' (expected e.g. v1.34.6+k3s1)"
+            exit 1
+          fi
+          if ! [[ "$RANCHER_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid Rancher version '$RANCHER_VERSION' (expected e.g. v2.13.6)"
+            exit 1
+          fi
+          echo "K3s: $K3S_VERSION | Rancher: $RANCHER_VERSION"
+
+      - name: Checkout PR code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Build agent image from PR
+        run: |
+          AGENT_IMAGE="${AGENT_REGISTRY}/${AGENT_IMAGE_REPOSITORY}:${AGENT_IMAGE_TAG}"
+          echo "AGENT_IMAGE=$AGENT_IMAGE" >> "$GITHUB_ENV"
+          docker build --file package/Dockerfile --tag "$AGENT_IMAGE" .
+
+      - name: Generate Setup Variables & Local DNS
+        env:
+          MODEL: ${{ matrix.llm.model }}
+        run: |
+          PASSWORD=$(openssl rand -base64 16)
+          echo "::add-mask::$PASSWORD"
+          echo "PASSWORD=$PASSWORD" >> "$GITHUB_ENV"
+
+          RUNNER_IP=$(hostname -I | awk '{print $1}')
+          echo "::add-mask::$RUNNER_IP"
+          echo "RUNNER_IP=$RUNNER_IP" >> "$GITHUB_ENV"
+
+          RANCHER_HOSTNAME="rancher.${RUNNER_IP}.com"
+          echo "::add-mask::$RANCHER_HOSTNAME"
+          echo "RANCHER_HOSTNAME=$RANCHER_HOSTNAME" >> "$GITHUB_ENV"
+          echo "RANCHER_URL=https://$RANCHER_HOSTNAME" >> "$GITHUB_ENV"
+
+          echo "$RUNNER_IP $RANCHER_HOSTNAME" | sudo tee -a /etc/hosts > /dev/null
+
+          # Replace characters that are not allowed in artifact names
+          echo "SAFE_MODEL_NAME=$(echo "$MODEL" | tr ':/' '--')" >> "$GITHUB_ENV"
+
+      - name: Install K3s
+        run: |
+          ulimit -n 65536
+          sudo K3S_VERSION="$K3S_VERSION" bash -eo pipefail -c '
+            set -e
+            trap '\''echo "❌ Command failed: $BASH_COMMAND" >&2'\'' ERR
+            sysctl -w fs.inotify.max_user_watches=1048576
+            sysctl -w fs.inotify.max_user_instances=512
+            curl -fsSL --show-error --connect-timeout 10 --max-time 60 --retry 2 --retry-delay 5 -o /tmp/install_k3s.sh https://get.k3s.io \
+              || { echo "⚠️ get.k3s.io failed, falling back to GitHub raw install script" >&2; \
+                   curl -fsSL --show-error --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 5 -o /tmp/install_k3s.sh https://raw.githubusercontent.com/k3s-io/k3s/master/install.sh; }
+            chmod +x /tmp/install_k3s.sh
+            INSTALL_K3S_VERSION="$K3S_VERSION" /tmp/install_k3s.sh
+            rm -f /tmp/install_k3s.sh
+            systemctl enable --now k3s.service
+            ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+            chmod 644 /etc/rancher/k3s/k3s.yaml
+          '
+          echo "Waiting for K3s to be ready..."
+          timeout 300 bash -c 'until kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 5; done'
+          timeout 300 bash -c 'until kubectl -n kube-system get deployment coredns &>/dev/null; do sleep 5; done'
+          kubectl -n kube-system rollout status deployment coredns --timeout=300s
+
+      - name: Import agent image into K3s
+        run: |
+          docker save "$AGENT_IMAGE" | sudo k3s ctr images import -
+          sudo k3s crictl images | grep rancher-ai-agent
+
+      - name: Patch CoreDNS for Local Resolution
+        run: |
+          kubectl get configmap coredns -n kube-system -o yaml > /tmp/coredns.yaml
+          sed -i "/hosts \/etc\/coredns\/NodeHosts/a \\      ${{ env.RUNNER_IP }} ${{ env.RANCHER_HOSTNAME }}" /tmp/coredns.yaml
+          kubectl replace -f /tmp/coredns.yaml
+
+          kubectl rollout restart deployment coredns -n kube-system
+          kubectl rollout status deployment coredns -n kube-system --timeout=90s
+
+      - name: Install Helm
+        run: |
+          HELM_VERSION=v3.17.3
+          HELM_SHA256=ee88b3c851ae6466a3de507f7be73fe94d54cbf2987cbaa3d1a3832ea331f2cd
+          curl -fsSL --show-error --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 5 \
+            -o /tmp/helm.tar.gz "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tar.gz" | sha256sum -c
+          tar -xzf /tmp/helm.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
+          sudo rm -rf /tmp/helm.tar.gz /tmp/linux-amd64
+
+      - name: Install Cert-Manager
+        run: |
+          curl -fsSL --show-error --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 5 \
+            -o /tmp/cert-manager.yaml "https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
+          kubectl apply -f /tmp/cert-manager.yaml
+          rm -f /tmp/cert-manager.yaml
+          kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=300s
+
+      - name: Install Rancher Manager
+        run: |
+          helm repo add rancher "$RANCHER_REPO"
+
+          # Install Rancher
+          helm install rancher rancher/rancher --namespace cattle-system \
+            --version "$(echo "$RANCHER_VERSION" | tr -d 'v')" \
+            --set hostname="${{ env.RANCHER_HOSTNAME }}" \
+            --set replicas=2 \
+            --set bootstrapPassword='${{ env.PASSWORD }}' \
+            --set global.cattle.psp.enabled=false \
+            --set image.tag="$RANCHER_VERSION" \
+            --set image.repository="rancher/rancher" \
+            --set image.registry="$(if echo "$RANCHER_REPO" | grep -q 'releases.rancher.com'; then echo 'docker.io'; elif echo "$RANCHER_REPO" | grep -q 'charts.rancher.com'; then echo 'registry.rancher.com'; else echo 'stgregistry.suse.com'; fi)" \
+            --wait \
+            --timeout=10m \
+            --create-namespace \
+            --devel
+
+          echo "Waiting for rancher-webhook..."
+          for _ in {1..30}; do
+            kubectl -n cattle-system get deployment rancher-webhook &>/dev/null && break
+            sleep 10
+          done
+          sleep 180  # Wait for Rancher components to fully initialize
+          echo 'Rancher installation complete.'
+
+      - name: Verify Rancher Availability
+        run: |
+          curl --fail --insecure --silent --show-error \
+            --connect-timeout 10 --max-time 30 \
+            --retry 5 --retry-delay 10 --retry-connrefused \
+            "https://${{ env.RANCHER_HOSTNAME }}" > /dev/null
+
+      - name: Generate API Token
+        run: |
+          for _ in {1..5}; do
+            TOKEN=$(curl -sk -X POST -H 'Content-Type: application/json' \
+              -d "{\"username\":\"admin\",\"password\":\"${{ env.PASSWORD }}\"}" \
+              "${{ env.RANCHER_URL }}/v3-public/localProviders/local?action=login" | jq -r .token)
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then break; fi
+            sleep 15
+          done
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" == "null" ]; then
+            echo "Failed to obtain Rancher API token"
+            exit 1
+          fi
+
+          echo "::add-mask::$TOKEN"
+          echo "RANCHER_API_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Install Liz AI Agent from PR chart
+        run: |
+          helm upgrade --install rancher-ai-agent ./chart/agent \
+            --namespace cattle-ai-agent-system \
+            --create-namespace \
+            --set global.cattle.systemDefaultRegistry="$AGENT_REGISTRY" \
+            --set aiAgent.image.repository="$AGENT_IMAGE_REPOSITORY" \
+            --set aiAgent.image.tag="$AGENT_IMAGE_TAG" \
+            --set aiAgent.image.pullPolicy=Never
+
+      - name: Install Liz UI
+        run: |
+          kubectl apply -f - << EOF
+          apiVersion: catalog.cattle.io/v1
+          kind: ClusterRepo
+          metadata:
+            name: ai-assistant-ui
+          spec:
+            gitBranch: gh-pages
+            gitRepo: ${AGENT_UI_GIT_REPO}
+          EOF
+
+          helm repo add ai-assistant-ui "$AGENT_UI_HELM_REPO" --force-update
+          helm repo update ai-assistant-ui
+          helm upgrade --install rancher-ai-ui ai-assistant-ui/rancher-ai-ui \
+            --namespace cattle-ui-plugin-system \
+            --create-namespace \
+            --devel \
+            --wait
+
+      - name: Display Installed Component Versions
+        run: |
+          echo "============================================================"
+          echo "📊 INSTALLED COMPONENT VERSIONS"
+          echo "============================================================"
+          echo "--- CONTAINER IMAGE VERSIONS (AI AGENT & MCP SERVER) ---"
+          kubectl get deployments -n cattle-ai-agent-system -o custom-columns="DEPLOYMENT:.metadata.name,IMAGE(S):.spec.template.spec.containers[*].image"
+          echo ""
+          echo "--- CONTAINER IMAGE VERSIONS (UI PLUGIN) ---"
+          kubectl get apps -n cattle-ui-plugin-system
+          echo "============================================================"
+
+      - name: Patch LLM Provider Secrets
+        env:
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_URL: ${{ secrets.OPENAI_URL }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          kubectl patch secret llm-secret \
+            --namespace cattle-ai-agent-system \
+            --type='merge' \
+            --patch-file=/dev/stdin <<EOF
+          {
+            "stringData": {
+              "GOOGLE_API_KEY": "${GOOGLE_API_KEY}",
+              "OPENAI_API_KEY": "${OPENAI_API_KEY}",
+              "OPENAI_URL": "${OPENAI_URL}",
+              "AWS_BEARER_TOKEN_BEDROCK": "${AWS_BEARER_TOKEN_BEDROCK}",
+              "AWS_REGION": "${AWS_REGION}"
+            }
+          }
+          EOF
+
+      - name: Configure Active LLM for Liz
+        env:
+          ACTIVE_LLM: ${{ matrix.llm.active_llm }}
+          MODEL_ID: ${{ matrix.llm.model }}
+        run: |
+          case "$ACTIVE_LLM" in
+            gemini)  MODEL_KEY="GEMINI_MODEL" ;;
+            bedrock) MODEL_KEY="BEDROCK_MODEL" ;;
+            openai)  MODEL_KEY="OPENAI_MODEL" ;;
+            *) echo "::error::Unsupported LLM provider '$ACTIVE_LLM'"; exit 1 ;;
+          esac
+
+          kubectl patch configmap llm-config \
+            --namespace cattle-ai-agent-system \
+            --type='merge' \
+            -p="{\"data\": {
+              \"ACTIVE_LLM\": \"${ACTIVE_LLM}\",
+              \"${MODEL_KEY}\": \"${MODEL_ID}\"
+            }}"
+
+          kubectl rollout restart deployment rancher-ai-agent --namespace cattle-ai-agent-system
+
+          if ! kubectl rollout status deployment rancher-ai-agent --namespace cattle-ai-agent-system --timeout=300s; then
+            echo "🚨 Rollout timed out or failed! Fetching debug information..."
+            kubectl get pods -n cattle-ai-agent-system
+            kubectl describe pods -l app=rancher-ai-agent -n cattle-ai-agent-system
+            kubectl logs -l app=rancher-ai-agent -n cattle-ai-agent-system --all-containers --tail=100
+            exit 1
+          fi
+
+      # Checked out after the PR image is built so the test code is not part of the build context
+      - name: Checkout liz-e2e tests
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rancher/liz-e2e
+          ref: ${{ env.LIZ_E2E_REF }}
+          ssh-key: ${{ secrets.LIZ_E2E_DEPLOY_KEY }}
+          path: liz-e2e
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14.8'
+
+      - name: Install Python dependencies
+        working-directory: liz-e2e
+        run: |
+          pip install uv
+          uv venv --seed .venv
+          uv pip install -r requirements.txt
+
+      - name: Execute Liz E2E smoke tests
+        working-directory: liz-e2e
+        env:
+          RANCHER_URL: ${{ env.RANCHER_URL }}
+          RANCHER_API_TOKEN: ${{ env.RANCHER_API_TOKEN }}
+
+          ACTIVE_LLM: ${{ matrix.llm.active_llm }}
+          MODEL: ${{ matrix.llm.model }}
+
+          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_URL: ${{ secrets.OPENAI_URL }}
+          AWS_BEARER_TOKEN_BEDROCK: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION }}
+        run: |
+          source .venv/bin/activate
+          export PYTHONWARNINGS="ignore:Unverified HTTPS request"
+          echo "============================================================"
+          echo "🚀 Testing Provider: $ACTIVE_LLM | Model: $MODEL | Marker: $PYTEST_MARKER"
+          echo "============================================================"
+          deepeval test run "$LIZ_E2E_TESTS" -m "$PYTEST_MARKER"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: liz-e2e-smoke-${{ matrix.llm.active_llm }}-${{ env.SAFE_MODEL_NAME }}-${{ github.run_id }}
+          path: |
+            liz-e2e/.deepeval/
+            liz-e2e-logs/
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Cleanup Local Environment
+        if: always()
+        run: |
+          echo "Tearing down K3s environment..."
+          sudo /usr/local/bin/k3s-uninstall.sh > /dev/null 2>&1 || true
+          docker image rm -f "$AGENT_IMAGE" > /dev/null 2>&1 || true
+          echo "Cleanup complete."
