@@ -4,8 +4,8 @@ name: Liz E2E Smoke Tests
 # rancher/liz-e2e `smoke` tests against it.
 #
 # Required repository secrets:
-#   LIZ_E2E_TOKEN   - fine-grained PAT (or GitHub App token) with read-only
-#                     `Contents` access to rancher/liz-e2e.
+#   LIZ_E2E_DEPLOY_KEY - private SSH key of a read-only deploy key added to
+#                        rancher/liz-e2e (Settings > Deploy keys).
 #   GOOGLE_API_KEY  - Gemini key used by the agent and the DeepEval judge.
 # Optional (only needed when the matching matrix entries are enabled):
 #   OPENAI_API_KEY, OPENAI_URL, AWS_BEARER_TOKEN_BEDROCK, AWS_REGION
@@ -93,10 +93,10 @@ jobs:
     steps:
       - name: Verify required secrets
         env:
-          LIZ_E2E_TOKEN: ${{ secrets.LIZ_E2E_TOKEN }}
+          LIZ_E2E_DEPLOY_KEY: ${{ secrets.LIZ_E2E_DEPLOY_KEY }}
         run: |
-          if [ -z "$LIZ_E2E_TOKEN" ]; then
-            echo "::error::LIZ_E2E_TOKEN secret is not configured. It needs read access to rancher/liz-e2e."
+          if [ -z "$LIZ_E2E_DEPLOY_KEY" ]; then
+            echo "::error::LIZ_E2E_DEPLOY_KEY secret is not configured. It must be a read-only deploy key of rancher/liz-e2e."
             exit 1
           fi
 
@@ -348,7 +348,7 @@ jobs:
         with:
           repository: rancher/liz-e2e
           ref: ${{ env.LIZ_E2E_REF }}
-          token: ${{ secrets.LIZ_E2E_TOKEN }}
+          ssh-key: ${{ secrets.LIZ_E2E_DEPLOY_KEY }}
           path: liz-e2e
           persist-credentials: false
 
